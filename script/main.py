@@ -1,15 +1,18 @@
+import os, sys, re, json, argparse, logging
+import time, datetime
 import requests
-import re
-import json
 import ddddocr
 import base64
-import time, datetime
-import argparse
 
-from encrypt import encryptAES
 from rich.console import Console
 from rich.table import Table
 from apscheduler.schedulers.blocking import BlockingScheduler
+from PIL import Image
+from io import BytesIO
+
+from encrypt import encryptAES
+
+logging.basicConfig(format='%(asctime)s %(filename)s %(funcName)s %(lineno)s [%(levelname)s]:%(message)s',filename=f"./logs/{datetime.datetime.now()}.log", encoding="utf-8", level=logging.INFO)
 
 login_url           = "https://newids.seu.edu.cn/authserver/login"
 activity_list_url   = "http://ehall.seu.edu.cn/gsapp/sys/jzxxtjapp/hdyy/queryActivityList.do"
@@ -20,13 +23,29 @@ headers = {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36"}
 
 """
+持续尝试直到无异常发生
+:return: func(args...)
+"""
+def doUntilSuccess(func, *args, counter = 100):
+    ret = None
+    while counter != 0:
+        try:
+            ret = func(*args)
+        except Exception as ex:
+            logging.warning(ex)
+            time.sleep(0.1)
+        else:
+            break
+    return ret
+
+"""
 使用用户名和密码登录网站获取Cookie
 :return: Session
 """
 def login(username: str, passwd: str) -> requests.Session:
-    session = requests.Session()
-    session.headers = headers
-    try:
+    def _login(username: str, passwd: str) -> requests.Session:
+        session = requests.Session()
+        session.headers = headers
         response = session.get(login_url, timeout=3)
         pattern = re.compile("<input type=\"hidden\" (name|id)=\"(.*?)\" value=\"(.*?)\"/?>")
         match = re.findall(pattern, response.text)
@@ -36,42 +55,37 @@ def login(username: str, passwd: str) -> requests.Session:
             if attr == "id":
                 form["password"] = encryptAES(passwd, val)
         response = session.post(login_url, data=form, timeout=3)
-    except requests.exceptions.Timeout:
-        # print("登陆超时！")
-        return None
-    except:
-        print("登陆失败，请重试！")
-        return None
-    
-    return session
+
+        return session
+
+    return doUntilSuccess(_login, username, passwd)
 
 """
 获取所有的讲座信息列表
 :return: dict
 """
 def getQueryList(session: requests.Session) -> list:
-    response = session.get(activity_list_url)
+    def _getQueryList(session: requests.Session) -> list:
+        response = session.get(activity_list_url, timeout=3)
 
-    form = {"pageIndex": 1,
-        "pageSize": 10,
-        "sortField": '',
-        "sortOrder": ''
-        }
-    
-    try:
+        form = {"pageIndex": 1,
+            "pageSize": 10,
+            "sortField": '',
+            "sortOrder": ''
+            }
+        
         response = session.post(activity_list_url, data=form, timeout=3)
-    except:
-        print("获取讲座信息失败！")
-        return None
 
-    obj = json.loads(response.text)
-    datas:list = obj["datas"]
-    while obj["pageIndex"] * obj["pageSize"] < obj["total"]:
-        form["pageIndex"] = obj["pageIndex"] + 1
-        response = session.post(activity_list_url, data=form, timeout=3)
         obj = json.loads(response.text)
-        datas += obj["datas"]
-    return datas
+        datas:list = obj["datas"]
+        while obj["pageIndex"] * obj["pageSize"] < obj["total"]:
+            form["pageIndex"] = obj["pageIndex"] + 1
+            response = session.post(activity_list_url, data=form, timeout=3)
+            obj = json.loads(response.text)
+            datas += obj["datas"]
+        return datas
+
+    return doUntilSuccess(_getQueryList, session)
 
 """
 获取对应ID的讲座的预约开始时间
@@ -84,7 +98,7 @@ def getReserveBeginTime(query_list: dict, WID: str) -> str :
     return None
 
 """
-获取字典列表中的某一个属性
+格式化输出讲座列表
 :return: dict
 """
 def printQueryListTable(query_list: list) -> list:
@@ -103,38 +117,48 @@ def printQueryListTable(query_list: list) -> list:
         else:
             table.add_row(id, name, timestamp)
 
-
     console.print(table)
 
 """
 使用给定的ID发起预约请求
 :return: bool
 """
-def reserveRequest(session: requests.Session, WID: str) -> bool:
-    response = session.get(verify_code_url)
-    b64code = json.loads(response.text)['result'].split(',')[1]
+def reserveRequest(session: requests.Session, WID: str):
+    def _reserveRequest(session: requests.Session, WID: str):
+        response = session.get(verify_code_url, timeout=3)
+        b64code = json.loads(response.text)['result'].split(',')[1]
 
-    # image = Image.open(BytesIO(base64.b64decode(b64code))).convert("RGB")
-    # image.save("tmp.jpeg")
+        # image = Image.open(BytesIO(base64.b64decode(b64code))).convert("RGB")
+        # image.save("tmp.jpeg")
 
-    ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
-    res = ocr.classification(base64.b64decode(b64code))
-    form = {'paramJson': json.dumps({'HD_WID':WID,'vcode':res})}
-    response = session.post(appoiment_url, data=form)
-    return json.loads(response.text)['code'] == 200
+        ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
+        res = ocr.classification(base64.b64decode(b64code))
+        form = {'paramJson': json.dumps({'HD_WID':WID,'vcode':res})}
+        response = session.post(appoiment_url, data=form, timeout=3)
+
+        response_obj = json.loads(response.text)
+        logging.info(response_obj)
+        print(response_obj)
+
+        if response_obj['code'] == 200:
+            return
+    
+        if "验证码错误" in response_obj['msg']:
+            raise Exception(f"验证码错误 {res}")
+        if "尚未开放" in response_obj['msg']:
+            raise Exception(f"尚未开放预约")
+
+    return doUntilSuccess(_reserveRequest, session, WID)
 
 """
 讲座预约工作函数
 :return: bool
 """
 def reserveJob(WID:str, username: str, password: str) -> bool:
-    session = None
-    while session is None:
-        session = login(username, password)
-    while not reserveRequest(session, WID):
-        time.sleep(0.1)
+    session = login(username, password)
+    reserveRequest(session, WID)
     session.close()
-    print(f"{datetime.datetime.now()} 预约成功!")
+    sys.exit(0)
         
 """
 定时任务
@@ -150,14 +174,12 @@ def schedule(WID: str, date: datetime.datetime, username: str, password: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", "-i", type=str, default=None)
-    parser.add_argument("--list", "-l", action="store_true")
+    parser.add_argument("--list", "-l", action="store_true", default=True)
     parser.add_argument("--username", "-u", type=str, required=True)
     parser.add_argument("--password", "-p", type=str, required=True)
     args = parser.parse_args()
 
-    session = None
-    while session is None:
-        session = login(args.username, args.password)
+    session = login(args.username, args.password)
     query_list = getQueryList(session)
     session.close()
 
@@ -168,7 +190,7 @@ if __name__ == "__main__":
         if date_str := getReserveBeginTime(query_list, args.id):
             begin_date = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
             if begin_date <= datetime.datetime.now():
-                reserveJob(args.id)
+                reserveJob(args.id, args.username, args.password)
             else:
                 schedule(args.id, begin_date - datetime.timedelta(seconds=5), args.username, args.password)
         else:
