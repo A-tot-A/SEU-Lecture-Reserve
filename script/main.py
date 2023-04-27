@@ -154,11 +154,17 @@ def reserveRequest(session: requests.Session, WID: str):
 讲座预约工作函数
 :return: bool
 """
-def reserveJob(WID:str, username: str, password: str) -> bool:
+def reserveJob(WID:str, username: str, password: str, date:datetime.datetime = None, scheduler:BlockingScheduler = None) -> bool:
     session = login(username, password)
+
+    while date and datetime.datetime.now() < date:
+        time.sleep(0.005)
+    
     reserveRequest(session, WID)
     session.close()
-    sys.exit(0)
+
+    if scheduler:
+        scheduler.shutdown(wait=False)
         
 """
 定时任务
@@ -166,7 +172,7 @@ def reserveJob(WID:str, username: str, password: str) -> bool:
 """
 def schedule(WID: str, date: datetime.datetime, username: str, password: str):
     sche = BlockingScheduler()
-    job = sche.add_job(reserveJob, trigger="date", args=[WID, username, password], next_run_time=date)
+    job = sche.add_job(reserveJob, trigger="date", args=[WID, username, password, date, sche], next_run_time=date - datetime.timedelta(seconds=10))
     sche.print_jobs()
     sche.start()
 
@@ -192,6 +198,6 @@ if __name__ == "__main__":
             if begin_date <= datetime.datetime.now():
                 reserveJob(args.id, args.username, args.password)
             else:
-                schedule(args.id, begin_date - datetime.timedelta(seconds=5), args.username, args.password)
+                schedule(args.id, begin_date, args.username, args.password)
         else:
             print("未找到的id！")
